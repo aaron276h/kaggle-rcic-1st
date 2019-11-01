@@ -19,6 +19,7 @@ from torch import nn
 import dataset
 import precomputed as P
 from model import ModelAndLoss
+import horovod.torch as hvd
 
 def parse_args():
     def lr_type(x):
@@ -112,7 +113,7 @@ def parse_args():
                  'then constant number each epoch')
 
     parser.add_argument('-b', '--batch_size', type=int, default=24)
-    parser.add_argument('--gradient-accumulation', type=int, default=2,
+    parser.add_argument('--gradient-accumulation', type=int, default=1,
             help='number of iterations for gradient accumulation')
     parser.add_argument('-e', '--epochs', type=int, default=90)
     parser.add_argument('-l', '--lr', type=lr_type, default=('cosine', [1.5e-4]),
@@ -120,6 +121,8 @@ def parse_args():
                  'in epoch range [0, epoch1) initial_lr=value1, in [epoch1, epoch2) initial_lr=value2, ..., '
                  'in [epoch{n-1}, total_epochs) initial_lr=value{n}, '
                  'in every range the same learning schedule is used. Possible schedules: cosine, const')
+
+    parser.add_argument('--horovod', type=bool, default=False)
     args = parser.parse_args()
 
     if args.mode == 'train':
@@ -148,6 +151,8 @@ def setup_logging(args):
 def setup_determinism(args):
     torch.backends.cudnn.deterministic = True
     torch.backends.cudnn.benchmark = False
+    # torch.backends.cudnn.deterministic = False
+    # torch.backends.cudnn.benchmark = True
     torch.manual_seed(args.seed)
     np.random.seed(args.seed)
     random.seed(args.seed)
@@ -410,6 +415,14 @@ def train(args, model):
 
     optimizer = torch.optim.Adam(model.parameters(), lr=0, weight_decay=args.wd)
 
+    if args.horovod:
+        optimizer = hvd.DistributedOptimizer(
+            optimizer, named_parameters=model.named_parameters(),
+            backward_passes_per_step=args.gradient_accumulation
+        )
+        hvd.broadcast_parameters(model.state_dict(), root_rank=0)
+        hvd.broadcast_optimizer_state(optimizer, root_rank=0)
+
     if args.fp16:
         model, optimizer = amp.initialize(model, optimizer, opt_level='O1')
 
@@ -453,13 +466,31 @@ def train(args, model):
 
             loss, acc = model.train_forward(X, S, Y)
             if args.fp16:
+                '''
                 with amp.scale_loss(loss, optimizer) as scaled_loss:
                     scaled_loss.backward()
+                    optimizer.synchronize()
+
+                if (i + 1) % args.gradient_accumulation == 0:
+                    with optimizer.skip_synchronize():
+                        optimizer.step()
+                    optimizer.zero_grad()
+                '''
+                apply_grads = (i + 1) % args.gradient_accumulation == 0
+                with amp.scale_loss(loss, optimizer) as scaled_loss:
+                    scaled_loss.backward()
+                    if hasattr(optimizer, "synchronize") and apply_grads:
+                        optimizer.synchronize()
+                if apply_grads:
+                    if hasattr(optimizer, "skip_synchronize"):
+                        with optimizer.skip_synchronize():
+                            optimizer.step()
+                    optimizer.zero_grad()
             else:
                 loss.backward()
-            if (i + 1) % args.gradient_accumulation == 0:
-                optimizer.step()
-                optimizer.zero_grad()
+                if (i + 1) % args.gradient_accumulation == 0:
+                    optimizer.step()
+                    optimizer.zero_grad()
 
             cum_count += 1
             cum_loss += loss.item()
@@ -481,6 +512,10 @@ def train(args, model):
             torch.save(model.state_dict(), str(args.save))
 
 def main(args):
+    if args.horovod:
+        hvd.init()
+        torch.cuda.set_device(hvd.local_rank())
+
     model = ModelAndLoss(args).cuda()
     logging.info('Model:\n{}'.format(str(model)))
 
